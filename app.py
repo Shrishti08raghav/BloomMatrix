@@ -17,7 +17,6 @@ st.set_page_config(
 # ==========================================================================
 # CONSTANTS & CONFIGURATION
 # ==========================================================================
-BACKEND_URL = "https://tugl24abp9.execute-api.us-east-1.amazonaws.com/bloom"
 N = 4500  # Number of particles
 fov_factor = 320  # Focal length for perspective projection
 camera_dist = 6.0  # Camera distance along Z-axis
