@@ -3,7 +3,10 @@ import mediapipe as mp
 import numpy as np
 import time
 import collections
+import threading
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
 
 # ==========================================================================
 # STREAMLIT PAGE CONFIG
@@ -24,8 +27,15 @@ morph_speed = 0.04  # Speed of shape morphing
 position_history_limit = 15
 finger_history_limit = 15
 
+# STUN server so WebRTC can establish a peer connection from the visitor's
+# browser to this server even across NATs/firewalls (needed for any cloud
+# host like Render, since the server has no camera of its own).
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
 # ==========================================================================
-# CACHED MODEL GENERATION (runs once per session, not on every rerun)
+# CACHED MODEL GENERATION (runs once per server process, not per session)
 # ==========================================================================
 @st.cache_resource(show_spinner="Generating procedural flower geometries...")
 def build_models():
@@ -393,36 +403,271 @@ def project_points(points, center_x, center_y, angle_x, angle_y, scale):
     return xs, ys, z_rot
 
 # ==========================================================================
-# SESSION STATE INITIALIZATION (persists across Streamlit reruns)
+# VIDEO PROCESSOR
+# All per-visitor mutable state lives as instance attributes here (NOT in
+# st.session_state), because recv() runs on a separate WebRTC worker thread
+# per connection. One instance is created per browser session.
 # ==========================================================================
-def init_state():
-    ss = st.session_state
-    ss.setdefault("active_model", "rose")
-    ss.setdefault("gesture_state", "NONE")
-    ss.setdefault("scatter_amount", 0.0)
-    ss.setdefault("target_scatter_amount", 0.0)
-    ss.setdefault("current_box_scale", 1.0)
-    ss.setdefault("target_box_scale", 1.0)
-    ss.setdefault("base_rotation_y", 0.0)
-    ss.setdefault("base_positions", None)
-    ss.setdefault("base_colors", None)
-    ss.setdefault("smoothed_position", np.zeros(3, dtype=np.float32))
-    ss.setdefault("target_position", np.zeros(3, dtype=np.float32))
-    ss.setdefault("raw_position_history", collections.deque(maxlen=position_history_limit))
-    ss.setdefault("finger_count_history", collections.deque(maxlen=finger_history_limit))
-    ss.setdefault("running", False)
-    # Second-hand controls
-    ss.setdefault("zoom_scale", 1.0)
-    ss.setdefault("target_zoom_scale", 1.0)
-    ss.setdefault("rot_offset", 0.0)
-    ss.setdefault("target_rot_offset", 0.0)
-    ss.setdefault("second_hand_tracking", False)
+class FlowerProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.models = build_models()
+        self.lock = threading.Lock()
 
-def get_smoothed_target(rx, ry, rz):
-    hist = st.session_state.raw_position_history
-    hist.append((rx, ry, rz))
-    avg = np.mean(hist, axis=0)
-    return avg[0], avg[1], avg[2]
+        self.active_model = "rose"
+        self.gesture_state = "NONE"
+        self.scatter_amount = 0.0
+        self.target_scatter_amount = 0.0
+        self.current_box_scale = 1.0
+        self.target_box_scale = 1.0
+        self.base_rotation_y = 0.0
+        self.base_positions = self.models["rose"][0].copy()
+        self.base_colors = self.models["rose"][1].copy()
+
+        self.smoothed_position = np.zeros(3, dtype=np.float32)
+        self.target_position = np.zeros(3, dtype=np.float32)
+        self.raw_position_history = collections.deque(maxlen=position_history_limit)
+        self.finger_count_history = collections.deque(maxlen=finger_history_limit)
+
+        self.zoom_scale = 1.0
+        self.target_zoom_scale = 1.0
+        self.rot_offset = 0.0
+        self.target_rot_offset = 0.0
+        self.second_hand_tracking = False
+        self.is_tracking = False
+
+        self.fps = 0
+        self.prev_time = time.time()
+
+        self.hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.55,
+            min_tracking_confidence=0.55
+        )
+
+    def jump_to_model(self, model_name):
+        with self.lock:
+            self.active_model = model_name
+            self.target_scatter_amount = 0.0
+            self.target_box_scale = 1.0
+
+    def _get_smoothed_target(self, rx, ry, rz):
+        self.raw_position_history.append((rx, ry, rz))
+        avg = np.mean(self.raw_position_history, axis=0)
+        return avg[0], avg[1], avg[2]
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
+        height, width, _ = img.shape
+
+        center_x = int(width * 0.72)
+        center_y = int(height * 0.5)
+
+        rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb_frame)
+
+        self.is_tracking = False
+        detected_gesture = 'NONE'
+        second_hand_landmarks = None
+
+        hand_list = results.multi_hand_landmarks if results.multi_hand_landmarks else []
+        if hand_list:
+            hand_list = sorted(hand_list, key=lambda hl: np.mean([lm.x for lm in hl.landmark]))
+            primary_hand_landmarks = hand_list[-1]
+            if len(hand_list) >= 2:
+                second_hand_landmarks = hand_list[0]
+        else:
+            primary_hand_landmarks = None
+
+        if primary_hand_landmarks is not None:
+            self.is_tracking = True
+            hand_landmarks = primary_hand_landmarks
+            wrist = hand_landmarks.landmark[0]
+
+            def is_extended(tip_idx, mcp_idx):
+                tip = hand_landmarks.landmark[tip_idx]
+                mcp = hand_landmarks.landmark[mcp_idx]
+                d_tip = np.hypot(np.hypot(tip.x - wrist.x, tip.y - wrist.y), tip.z - wrist.z)
+                d_mcp = np.hypot(np.hypot(mcp.x - wrist.x, mcp.y - wrist.y), mcp.z - wrist.z)
+                return d_tip > d_mcp
+
+            open_fingers = sum([
+                is_extended(8, 5),
+                is_extended(12, 9),
+                is_extended(16, 13),
+                is_extended(20, 17)
+            ])
+
+            self.finger_count_history.append(open_fingers)
+            avg_fingers = np.mean(self.finger_count_history)
+
+            if avg_fingers >= 3.0:
+                detected_gesture = 'OPEN'
+            elif avg_fingers <= 0.8:
+                detected_gesture = 'CLOSED'
+            else:
+                detected_gesture = self.gesture_state
+
+            raw_x = (0.5 - wrist.x) * 6.5
+            raw_y = (0.5 - wrist.y) * 4.5
+            raw_z = (wrist.z + 0.1) * 8.0
+
+            sm_x, sm_y, sm_z = self._get_smoothed_target(raw_x, raw_y, raw_z)
+            self.target_position[0] = sm_x
+            self.target_position[1] = sm_y
+            self.target_position[2] = sm_z
+        else:
+            if self.gesture_state != 'NONE':
+                self.gesture_state = 'NONE'
+                self.target_scatter_amount = 0.0
+                self.target_box_scale = 1.0
+                self.finger_count_history.clear()
+                self.raw_position_history.clear()
+            self.target_position[:] = 0.0
+
+        if second_hand_landmarks is not None:
+            self.second_hand_tracking = True
+            sec_wrist = second_hand_landmarks.landmark[0]
+            self.target_zoom_scale = float(
+                np.clip(np.interp(sec_wrist.y, [0.15, 0.85], [1.8, 0.55]), 0.4, 2.2)
+            )
+            self.target_rot_offset = float((0.5 - sec_wrist.x) * 2.4)
+        else:
+            self.second_hand_tracking = False
+            self.target_zoom_scale = 1.0
+            self.target_rot_offset = 0.0
+
+        self.smoothed_position += (self.target_position - self.smoothed_position) * 0.06
+        self.zoom_scale += (self.target_zoom_scale - self.zoom_scale) * 0.08
+        self.rot_offset += (self.target_rot_offset - self.rot_offset) * 0.08
+
+        if detected_gesture != self.gesture_state and detected_gesture != 'NONE':
+            if detected_gesture == 'OPEN':
+                self.target_scatter_amount = 2.4
+                self.target_box_scale = 1.35
+            elif detected_gesture == 'CLOSED':
+                idx = model_order.index(self.active_model)
+                self.active_model = model_order[(idx + 1) % len(model_order)]
+                self.target_scatter_amount = 0.0
+                self.target_box_scale = 1.0
+            self.gesture_state = detected_gesture
+
+        self.scatter_amount += (self.target_scatter_amount - self.scatter_amount) * 0.045
+        self.current_box_scale += (self.target_box_scale - self.current_box_scale) * 0.08
+
+        tx_pos, tx_col = self.models[self.active_model]
+        self.base_positions += (tx_pos - self.base_positions) * morph_speed
+        self.base_colors += (tx_col - self.base_colors) * morph_speed
+
+        base_positions = self.base_positions
+        base_colors = self.base_colors
+        scatter_amount = self.scatter_amount
+
+        if scatter_amount > 0.02:
+            time_scale = time.time() * 2.2
+            expansion = 1.0 + scatter_amount * 0.85
+
+            indices = np.arange(N)
+            noise_x = np.sin(time_scale + indices * 0.17) * scatter_amount * 0.4
+            noise_y = np.cos(time_scale * 0.8 + indices * 0.23) * scatter_amount * 0.4
+            noise_z = np.sin(time_scale * 1.3 - indices * 0.13) * scatter_amount * 0.4
+
+            render_positions = base_positions * expansion
+            render_positions[:, 0] += noise_x
+            render_positions[:, 1] += noise_y
+            render_positions[:, 2] += noise_z
+        else:
+            render_positions = base_positions.copy()
+
+        self.base_rotation_y += 0.005
+        angle_x = self.smoothed_position[1] * 0.12
+        angle_y = self.base_rotation_y + self.smoothed_position[0] * 0.12 + self.rot_offset
+        zoom_scale = self.zoom_scale
+
+        xs, ys, zs = project_points(render_positions, center_x, center_y, angle_x, angle_y, zoom_scale)
+        c_xs, c_ys, c_zs = project_points(box_corners, center_x, center_y, angle_x, angle_y,
+                                           self.current_box_scale * zoom_scale)
+
+        depth_indices = np.argsort(zs)[::-1]
+        xs_sorted = xs[depth_indices]
+        ys_sorted = ys[depth_indices]
+        col_sorted = base_colors[depth_indices]
+
+        grid_lines_3d = []
+        for x_val in np.linspace(-3.0, 3.0, 7):
+            grid_lines_3d.append([x_val, -2.5, -3.0])
+            grid_lines_3d.append([x_val, -2.5,  3.0])
+        for z_val in np.linspace(-3.0, 3.0, 7):
+            grid_lines_3d.append([-3.0, -2.5, z_val])
+            grid_lines_3d.append([ 3.0, -2.5, z_val])
+        grid_lines_3d = np.array(grid_lines_3d, dtype=np.float32)
+        grid_lines_3d[:, 0] += 1.6
+
+        g_xs, g_ys, _ = project_points(grid_lines_3d, center_x, center_y, angle_x, angle_y, 1.0)
+        for g_idx in range(0, len(g_xs), 2):
+            cv2.line(img, (g_xs[g_idx], g_ys[g_idx]), (g_xs[g_idx + 1], g_ys[g_idx + 1]), (120, 60, 40), 1)
+
+        box_color_bgr = (254, 242, 0)
+        if self.gesture_state == 'OPEN':
+            box_color_bgr = (126, 71, 255)
+        else:
+            box_color_bgr = model_names[self.active_model][1]
+
+        for edge in box_edges:
+            p1, p2 = edge
+            cv2.line(img, (c_xs[p1], c_ys[p1]), (c_xs[p2], c_ys[p2]), box_color_bgr, 1, cv2.LINE_AA)
+
+        for c_idx in range(8):
+            cv2.circle(img, (c_xs[c_idx], c_ys[c_idx]), 4, box_color_bgr, -1, cv2.LINE_AA)
+
+        for i in range(N):
+            px, py = xs_sorted[i], ys_sorted[i]
+            if 0 <= px < width and 0 <= py < height:
+                b = int(col_sorted[i, 2] * 255)
+                g = int(col_sorted[i, 1] * 255)
+                r = int(col_sorted[i, 0] * 255)
+                cv2.circle(img, (px, py), 2, (b, g, r), -1)
+
+        hud_x = int(width * 0.65)
+        hud_y_start = int(height * 0.12)
+
+        cv2.rectangle(img, (hud_x - 15, hud_y_start - 30), (width - 40, hud_y_start + 140), (12, 10, 8), -1)
+        cv2.rectangle(img, (hud_x - 15, hud_y_start - 30), (width - 40, hud_y_start + 140), (45, 40, 35), 1)
+
+        lbl_text, lbl_color = model_names[self.active_model]
+        cv2.putText(img, "ACTIVE MODEL:", (hud_x, hud_y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 150, 140), 1, cv2.LINE_AA)
+        cv2.putText(img, lbl_text, (hud_x, hud_y_start + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.62, lbl_color, 2, cv2.LINE_AA)
+
+        gesture_lbl = "ASSEMBLED"
+        gesture_col = (160, 214, 6)
+        if self.gesture_state == 'OPEN':
+            gesture_lbl = "SCATTERED"
+            gesture_col = (126, 71, 255)
+        elif self.gesture_state == 'NONE':
+            gesture_lbl = "WAITING..."
+            gesture_col = (160, 150, 140)
+
+        cv2.putText(img, "GESTURE STATE:", (hud_x, hud_y_start + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 150, 140), 1, cv2.LINE_AA)
+        cv2.putText(img, gesture_lbl, (hud_x, hud_y_start + 77), cv2.FONT_HERSHEY_SIMPLEX, 0.58, gesture_col, 2, cv2.LINE_AA)
+
+        status_text = "HAND TRACKED" if self.is_tracking else "SEARCHING FOR HAND..."
+        status_col = (6, 214, 160) if self.is_tracking else (140, 150, 160)
+        cv2.putText(img, status_text, (hud_x, hud_y_start + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.40, status_col, 1, cv2.LINE_AA)
+
+        second_hand_text = (
+            f"2ND HAND: ZOOM {zoom_scale:.2f}x" if self.second_hand_tracking
+            else "2ND HAND: NOT DETECTED"
+        )
+        second_hand_col = (255, 191, 0) if self.second_hand_tracking else (110, 105, 100)
+        cv2.putText(img, second_hand_text, (hud_x, hud_y_start + 123), cv2.FONT_HERSHEY_SIMPLEX, 0.40, second_hand_col, 1, cv2.LINE_AA)
+
+        curr_time = time.time()
+        self.fps = int(1.0 / max(0.001, curr_time - self.prev_time))
+        self.prev_time = curr_time
+        cv2.putText(img, f"FPS: {self.fps}", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (6, 214, 160), 2, cv2.LINE_AA)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ==========================================================================
 # STREAMLIT UI
@@ -430,17 +675,8 @@ def get_smoothed_target(rx, ry, rz):
 st.title("🌹 3D Holographic Flower Interactive Showcase")
 st.caption("Hand-gesture controlled particle-cloud flowers, rendered live from your webcam feed.")
 
-init_state()
-models = build_models()
-if st.session_state.base_positions is None:
-    st.session_state.base_positions = models["rose"][0].copy()
-    st.session_state.base_colors = models["rose"][1].copy()
-
 with st.sidebar:
     st.header("Controls")
-    run = st.checkbox("Start camera", value=st.session_state.running)
-    st.session_state.running = run
-    st.markdown("---")
     st.subheader("Primary hand (right side)")
     st.write("✋ **Open hand** — scatter the particles")
     st.write("✊ **Closed hand** — morph to the next flower")
@@ -451,295 +687,42 @@ with st.sidebar:
     st.write("⬅️➡️ **Move left / right** — extra spin")
     st.caption("Show both hands to camera. The hand further right drives gestures; the other hand controls zoom & spin.")
     st.markdown("---")
+
+ctx = webrtc_streamer(
+    key="flower-showcase",
+    video_processor_factory=FlowerProcessor,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"video": {"width": 1280, "height": 720}, "audio": False},
+    async_processing=True,
+)
+
+with st.sidebar:
     st.subheader("Jump to a flower")
     for m in model_order:
-        label, color_bgr = model_names[m]
+        label, _ = model_names[m]
         if st.button(label.title(), key=f"jump_{m}", use_container_width=True):
-            st.session_state.active_model = m
-            st.session_state.target_scatter_amount = 0.0
-            st.session_state.target_box_scale = 1.0
+            if ctx.video_processor:
+                ctx.video_processor.jump_to_model(m)
     st.markdown("---")
     status_placeholder = st.empty()
 
-frame_placeholder = st.empty()
-fps_placeholder = st.empty()
-
-if run:
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.error("Could not open the webcam. Check camera permissions and try again.")
-    else:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        mp_hands = mp.solutions.hands
-        hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.55,
-            min_tracking_confidence=0.55
-        )
-
-        prev_time = time.time()
-
-        while st.session_state.running:
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("Lost connection to the webcam.")
-                break
-
-            frame = cv2.flip(frame, 1)
-            height, width, _ = frame.shape
-
-            center_x = int(width * 0.72)
-            center_y = int(height * 0.5)
-
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb_frame)
-
-            is_tracking = False
-            detected_gesture = 'NONE'
-            second_hand_landmarks = None
-
-            hand_list = results.multi_hand_landmarks if results.multi_hand_landmarks else []
-
-            # Sort detected hands left-to-right by average landmark x.
-            # The right-most hand is the PRIMARY (gesture/tilt) hand, since it
-            # sits near the flower which renders on the right side of the frame.
-            # A second hand further left becomes the SECONDARY (zoom/spin) hand.
-            if hand_list:
-                hand_list = sorted(
-                    hand_list,
-                    key=lambda hl: np.mean([lm.x for lm in hl.landmark])
-                )
-                primary_hand_landmarks = hand_list[-1]
-                if len(hand_list) >= 2:
-                    second_hand_landmarks = hand_list[0]
-            else:
-                primary_hand_landmarks = None
-
-            if primary_hand_landmarks is not None:
-                is_tracking = True
-                hand_landmarks = primary_hand_landmarks
-
-                wrist = hand_landmarks.landmark[0]
-
-                def is_extended(tip_idx, mcp_idx):
-                    tip = hand_landmarks.landmark[tip_idx]
-                    mcp = hand_landmarks.landmark[mcp_idx]
-                    d_tip = np.hypot(np.hypot(tip.x - wrist.x, tip.y - wrist.y), tip.z - wrist.z)
-                    d_mcp = np.hypot(np.hypot(mcp.x - wrist.x, mcp.y - wrist.y), mcp.z - wrist.z)
-                    return d_tip > d_mcp
-
-                open_fingers = sum([
-                    is_extended(8, 5),
-                    is_extended(12, 9),
-                    is_extended(16, 13),
-                    is_extended(20, 17)
-                ])
-
-                st.session_state.finger_count_history.append(open_fingers)
-                avg_fingers = np.mean(st.session_state.finger_count_history)
-
-                if avg_fingers >= 3.0:
-                    detected_gesture = 'OPEN'
-                elif avg_fingers <= 0.8:
-                    detected_gesture = 'CLOSED'
-                else:
-                    detected_gesture = st.session_state.gesture_state
-
-                raw_x = (0.5 - wrist.x) * 6.5
-                raw_y = (0.5 - wrist.y) * 4.5
-                raw_z = (wrist.z + 0.1) * 8.0
-
-                sm_x, sm_y, sm_z = get_smoothed_target(raw_x, raw_y, raw_z)
-                st.session_state.target_position[0] = sm_x
-                st.session_state.target_position[1] = sm_y
-                st.session_state.target_position[2] = sm_z
-            else:
-                if st.session_state.gesture_state != 'NONE':
-                    st.session_state.gesture_state = 'NONE'
-                    st.session_state.target_scatter_amount = 0.0
-                    st.session_state.target_box_scale = 1.0
-                    st.session_state.finger_count_history.clear()
-                    st.session_state.raw_position_history.clear()
-                st.session_state.target_position[:] = 0.0
-
-            # --- Secondary hand: zoom (vertical position) + extra spin (horizontal) ---
-            if second_hand_landmarks is not None:
-                st.session_state.second_hand_tracking = True
-                sec_wrist = second_hand_landmarks.landmark[0]
-                # Raise hand (small y) -> zoom in. Lower hand (large y) -> zoom out.
-                st.session_state.target_zoom_scale = float(
-                    np.clip(np.interp(sec_wrist.y, [0.15, 0.85], [1.8, 0.55]), 0.4, 2.2)
-                )
-                # Move hand left/right of center -> extra rotation offset.
-                st.session_state.target_rot_offset = float((0.5 - sec_wrist.x) * 2.4)
-            else:
-                st.session_state.second_hand_tracking = False
-                st.session_state.target_zoom_scale = 1.0
-                st.session_state.target_rot_offset = 0.0
-
-            st.session_state.smoothed_position += (
-                st.session_state.target_position - st.session_state.smoothed_position
-            ) * 0.06
-
-            st.session_state.zoom_scale += (
-                st.session_state.target_zoom_scale - st.session_state.zoom_scale
-            ) * 0.08
-
-            st.session_state.rot_offset += (
-                st.session_state.target_rot_offset - st.session_state.rot_offset
-            ) * 0.08
-
-            if detected_gesture != st.session_state.gesture_state and detected_gesture != 'NONE':
-                if detected_gesture == 'OPEN':
-                    st.session_state.target_scatter_amount = 2.4
-                    st.session_state.target_box_scale = 1.35
-                elif detected_gesture == 'CLOSED':
-                    idx = model_order.index(st.session_state.active_model)
-                    st.session_state.active_model = model_order[(idx + 1) % len(model_order)]
-                    st.session_state.target_scatter_amount = 0.0
-                    st.session_state.target_box_scale = 1.0
-                st.session_state.gesture_state = detected_gesture
-
-            st.session_state.scatter_amount += (
-                st.session_state.target_scatter_amount - st.session_state.scatter_amount
-            ) * 0.045
-
-            st.session_state.current_box_scale += (
-                st.session_state.target_box_scale - st.session_state.current_box_scale
-            ) * 0.08
-
-            tx_pos, tx_col = models[st.session_state.active_model]
-
-            st.session_state.base_positions += (tx_pos - st.session_state.base_positions) * morph_speed
-            st.session_state.base_colors += (tx_col - st.session_state.base_colors) * morph_speed
-
-            base_positions = st.session_state.base_positions
-            base_colors = st.session_state.base_colors
-            scatter_amount = st.session_state.scatter_amount
-
-            if scatter_amount > 0.02:
-                time_scale = time.time() * 2.2
-                expansion = 1.0 + scatter_amount * 0.85
-
-                indices = np.arange(N)
-                noise_x = np.sin(time_scale + indices * 0.17) * scatter_amount * 0.4
-                noise_y = np.cos(time_scale * 0.8 + indices * 0.23) * scatter_amount * 0.4
-                noise_z = np.sin(time_scale * 1.3 - indices * 0.13) * scatter_amount * 0.4
-
-                render_positions = base_positions * expansion
-                render_positions[:, 0] += noise_x
-                render_positions[:, 1] += noise_y
-                render_positions[:, 2] += noise_z
-            else:
-                render_positions = base_positions.copy()
-
-            st.session_state.base_rotation_y += 0.005
-            angle_x = st.session_state.smoothed_position[1] * 0.12
-            angle_y = (
-                st.session_state.base_rotation_y
-                + st.session_state.smoothed_position[0] * 0.12
-                + st.session_state.rot_offset
+if ctx.state.playing:
+    while ctx.state.playing:
+        vp = ctx.video_processor
+        if vp is not None:
+            lbl_text, _ = model_names[vp.active_model]
+            gesture_lbl = {"OPEN": "SCATTERED", "CLOSED": "ASSEMBLED", "NONE": "WAITING..."}.get(
+                vp.gesture_state, "ASSEMBLED"
             )
-            zoom_scale = st.session_state.zoom_scale
-
-            xs, ys, zs = project_points(render_positions, center_x, center_y, angle_x, angle_y, zoom_scale)
-            c_xs, c_ys, c_zs = project_points(box_corners, center_x, center_y, angle_x, angle_y,
-                                               st.session_state.current_box_scale * zoom_scale)
-
-            depth_indices = np.argsort(zs)[::-1]
-            xs_sorted = xs[depth_indices]
-            ys_sorted = ys[depth_indices]
-            col_sorted = base_colors[depth_indices]
-
-            grid_lines_3d = []
-            for x_val in np.linspace(-3.0, 3.0, 7):
-                grid_lines_3d.append([x_val, -2.5, -3.0])
-                grid_lines_3d.append([x_val, -2.5,  3.0])
-            for z_val in np.linspace(-3.0, 3.0, 7):
-                grid_lines_3d.append([-3.0, -2.5, z_val])
-                grid_lines_3d.append([ 3.0, -2.5, z_val])
-            grid_lines_3d = np.array(grid_lines_3d, dtype=np.float32)
-            grid_lines_3d[:, 0] += 1.6
-
-            g_xs, g_ys, _ = project_points(grid_lines_3d, center_x, center_y, angle_x, angle_y, 1.0)
-            for g_idx in range(0, len(g_xs), 2):
-                cv2.line(frame, (g_xs[g_idx], g_ys[g_idx]), (g_xs[g_idx + 1], g_ys[g_idx + 1]), (120, 60, 40), 1)
-
-            box_color_bgr = (254, 242, 0)
-            if st.session_state.gesture_state == 'OPEN':
-                box_color_bgr = (126, 71, 255)
-            else:
-                box_color_bgr = model_names[st.session_state.active_model][1]
-
-            for edge in box_edges:
-                p1, p2 = edge
-                cv2.line(frame, (c_xs[p1], c_ys[p1]), (c_xs[p2], c_ys[p2]), box_color_bgr, 1, cv2.LINE_AA)
-
-            for c_idx in range(8):
-                cv2.circle(frame, (c_xs[c_idx], c_ys[c_idx]), 4, box_color_bgr, -1, cv2.LINE_AA)
-
-            for i in range(N):
-                px, py = xs_sorted[i], ys_sorted[i]
-                if 0 <= px < width and 0 <= py < height:
-                    b = int(col_sorted[i, 2] * 255)
-                    g = int(col_sorted[i, 1] * 255)
-                    r = int(col_sorted[i, 0] * 255)
-                    cv2.circle(frame, (px, py), 2, (b, g, r), -1)
-
-            hud_x = int(width * 0.65)
-            hud_y_start = int(height * 0.12)
-
-            cv2.rectangle(frame, (hud_x - 15, hud_y_start - 30), (width - 40, hud_y_start + 140), (12, 10, 8), -1)
-            cv2.rectangle(frame, (hud_x - 15, hud_y_start - 30), (width - 40, hud_y_start + 140), (45, 40, 35), 1)
-
-            lbl_text, lbl_color = model_names[st.session_state.active_model]
-            cv2.putText(frame, "ACTIVE MODEL:", (hud_x, hud_y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 150, 140), 1, cv2.LINE_AA)
-            cv2.putText(frame, lbl_text, (hud_x, hud_y_start + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.62, lbl_color, 2, cv2.LINE_AA)
-
-            gesture_lbl = "ASSEMBLED"
-            gesture_col = (160, 214, 6)
-            if st.session_state.gesture_state == 'OPEN':
-                gesture_lbl = "SCATTERED"
-                gesture_col = (126, 71, 255)
-            elif st.session_state.gesture_state == 'NONE':
-                gesture_lbl = "WAITING..."
-                gesture_col = (160, 150, 140)
-
-            cv2.putText(frame, "GESTURE STATE:", (hud_x, hud_y_start + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 150, 140), 1, cv2.LINE_AA)
-            cv2.putText(frame, gesture_lbl, (hud_x, hud_y_start + 77), cv2.FONT_HERSHEY_SIMPLEX, 0.58, gesture_col, 2, cv2.LINE_AA)
-
-            status_text = "HAND TRACKED" if is_tracking else "SEARCHING FOR HAND..."
-            status_col = (6, 214, 160) if is_tracking else (140, 150, 160)
-            cv2.putText(frame, status_text, (hud_x, hud_y_start + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.40, status_col, 1, cv2.LINE_AA)
-
-            second_hand_text = (
-                f"2ND HAND: ZOOM {zoom_scale:.2f}x" if st.session_state.second_hand_tracking
-                else "2ND HAND: NOT DETECTED"
-            )
-            second_hand_col = (255, 191, 0) if st.session_state.second_hand_tracking else (110, 105, 100)
-            cv2.putText(frame, second_hand_text, (hud_x, hud_y_start + 123), cv2.FONT_HERSHEY_SIMPLEX, 0.40, second_hand_col, 1, cv2.LINE_AA)
-
-            curr_time = time.time()
-            fps = int(1.0 / max(0.001, curr_time - prev_time))
-            prev_time = curr_time
-            cv2.putText(frame, f"FPS: {fps}", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (6, 214, 160), 2, cv2.LINE_AA)
-
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-
             with status_placeholder.container():
                 st.write(f"**Model:** {lbl_text.title()}")
                 st.write(f"**Gesture:** {gesture_lbl}")
-                if st.session_state.second_hand_tracking:
-                    st.write(f"**Zoom:** {zoom_scale:.2f}x")
+                if vp.second_hand_tracking:
+                    st.write(f"**Zoom:** {vp.zoom_scale:.2f}x")
                 else:
                     st.write("**Zoom:** (show second hand)")
-                st.write(f"**FPS:** {fps}")
-
-        cap.release()
-        hands.close()
+                st.write(f"**FPS:** {vp.fps}")
+        time.sleep(0.5)
 else:
-    frame_placeholder.info("Camera is stopped. Check **Start camera** in the sidebar to begin.")
+    frame_placeholder = st.empty()
+    frame_placeholder.info("Click **START** above to allow camera access and begin.")
