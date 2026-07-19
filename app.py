@@ -438,12 +438,18 @@ class FlowerProcessor(VideoProcessorBase):
         self.fps = 0
         self.prev_time = time.time()
 
-        self.hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.55,
-            min_tracking_confidence=0.55
-        )
+        self.hands = None
+        self.init_error = None
+        try:
+            self.hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=0.55,
+                min_tracking_confidence=0.55
+            )
+        except Exception as e:
+            # Surface the real cause instead of crashing the whole app silently.
+            self.init_error = f"{type(e).__name__}: {e}"
 
     def jump_to_model(self, model_name):
         with self.lock:
@@ -460,6 +466,13 @@ class FlowerProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="bgr24")
         img = cv2.flip(img, 1)
         height, width, _ = img.shape
+
+        if self.hands is None:
+            cv2.putText(img, "MediaPipe failed to initialize:", (30, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+            msg = (self.init_error or "unknown error")[:80]
+            cv2.putText(img, msg, (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
         center_x = int(width * 0.72)
         center_y = int(height * 0.5)
@@ -709,6 +722,10 @@ with st.sidebar:
 if ctx.state.playing:
     while ctx.state.playing:
         vp = ctx.video_processor
+        if vp is not None and vp.hands is None:
+            status_placeholder.error(f"MediaPipe init failed:\n\n{vp.init_error}")
+            time.sleep(1.0)
+            continue
         if vp is not None:
             lbl_text, _ = model_names[vp.active_model]
             gesture_lbl = {"OPEN": "SCATTERED", "CLOSED": "ASSEMBLED", "NONE": "WAITING..."}.get(
